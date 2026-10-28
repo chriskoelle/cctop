@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""cctop: a live list of running Claude Code sessions, meant for a pinned Warp tab.
+
+  cctop                 interactive view (fzf), refreshes every few seconds
+  cctop list            one snapshot, tab-separated (what the view renders)
+  cctop preview <id>    details for one session
+  cctop jump <id>       focus the session's Warp tab (via its warp://session focus link)
+  cctop close <id>      stop a session after confirmation
+  cctop attach <id>     attach to a background session
+  cctop open-pr <id>    open the session's linked PR in the browser
+  cctop code <id>       open the session's directory in VS Code
+  cctop diff <id>       page through the session's changes against the default branch
+  cctop reopen <session-id> <dir> <title>   resume a session in a new Warp tab
+
+Sessions come from `claude agents --json`; titles, branch, PR and last messages from each
+session's transcript tail. PR states are fetched with `gh` in the background and cached.
+
+Requires macOS, Warp, Python 3.8+, fzf 0.71+ and the Claude Code CLI; `gh`, VS Code's `code` and
+diff-so-fancy are optional. Parts of it read Claude Code and Warp files that aren't documented
+interfaces, so an update to either can break things.
+"""
+import glob
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "cctop")
+META_CACHE = os.path.join(CACHE_DIR, "meta.json")
+PR_CACHE = os.path.join(CACHE_DIR, "prs.json")
+SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
+PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
+
+REFRESH_SECONDS = 3
+PR_REFRESH_SECONDS = 120
+TAIL_BYTES = 768 * 1024
+
+RESET, DIM, BOLD, CYAN = "\033[0m", "\033[2m", "\033[1m", "\033[36m"
+RED, GREEN, YELLOW, BLUE, MAGENTA = "\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[35m"
+
+
+# ---------------------------------------------------------------- data
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+class AgentsUnavailable(Exception):
+    pass
+
+
+def agents():
+    """Running sessions. Raises rather than returning [] on failure: an empty list would read as
+    every session having ended, and get logged that way."""
+    try:
+        out = subprocess.run(["claude", "agents", "--json"], capture_output=True, text=True, timeout=10).stdout
+        result = json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise AgentsUnavailable(str(e))
+    if not isinstance(result, list):
+        raise AgentsUnavailable("unexpected output from claude agents")
+    return result
+
+
+def transcript_path(session_id):
+    hits = glob.glob(os.path.join(PROJECTS_DIR, "*", session_id + ".jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+    return ""
+
+
+def parse_tail(path):
+    """Pull the latest title/branch/PR/messages out of the end of a transcript."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - TAIL_BYTES))
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    if size > TAIL_BYTES:
+        lines = lines[1:]  # first line is probably cut off
+
+    meta = {}
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        t = d.get("type")
+        if t == "custom-title":
+            meta.setdefault("customTitle", d.get("customTitle"))
+        elif t == "ai-title":
+            meta.setdefault("aiTitle", d.get("aiTitle"))
+        elif t == "pr-link":
+            meta.setdefault("pr", {"number": d.get("prNumber"), "url": d.get("prUrl")})
+        elif t == "last-prompt":
+            meta.setdefault("lastPrompt", d.get("lastPrompt"))
+        elif t == "assistant" and "lastReply" not in meta:
+            txt = text_of((d.get("message") or {}).get("content")).strip()
+            if txt:
+                meta["lastReply"] = txt
+        if t == "user" and d.get("entrypoint"):
+            meta.setdefault("entrypoint", d["entrypoint"])
+            meta["prompts"] = max(meta.get("prompts", 0), (d.get("turnPosition") or {}).get("promptIndex") or 0)
+        if d.get("cwd"):
+            meta.setdefault("lastCwd", d["cwd"])
+        if d.get("gitBranch"):
+            meta.setdefault("branch", d["gitBranch"])
+        if d.get("timestamp"):
+            meta.setdefault("lastActivity", d["timestamp"])
+    return meta
+
+
+def meta_for_path(path, cache):
+    st = os.stat(path)
+    hit = cache.get(path)
+    if hit and hit["mtime"] == st.st_mtime and hit["size"] == st.st_size:
+        meta = hit["meta"]
+    else:
+        meta = parse_tail(path)
+        cache[path] = {"mtime": st.st_mtime, "size": st.st_size, "meta": meta}
+    return dict(meta, transcript=path, transcriptMtime=st.st_mtime)
+
+
+def transcript_meta(session_id, cache):
+    path = transcript_path(session_id)
+    return meta_for_path(path, cache) if path else {}
+
+
+# Recently ended sessions: interactive terminal conversations with a few prompts whose process is
+# gone. Covers ^x, /exit, closed tabs and Warp restarts alike. Claude doesn't record when a session
+# ended, so the view also tracks which Warp sessions are live (LIVE) and logs the ones that vanish
+# (ENDED), grouped by the tick they vanished in; a group of several is a Warp quit or restart.
+CLOSED_HOURS = 24
+CLOSED_MAX = 8
+CLOSED_MIN_PROMPTS = 2
+DISMISSED = os.path.join(CACHE_DIR, "dismissed.json")
+LIVE = os.path.join(CACHE_DIR, "live.json")
+ENDED = os.path.join(CACHE_DIR, "ended.json")
+TICK_GAP = 60  # longer between snapshots means the view wasn't running; times are then approximate
+
+
+def closed_sessions(live_ids, cache):
+    cutoff = time.time() - CLOSED_HOURS * 3600
+    dismissed = set(load_json(DISMISSED, []))
+    ended = load_json(ENDED, {})
+    candidates = {}
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            candidates[os.path.basename(path)[:-len(".jsonl")]] = path
+    for sid in ended:
+        candidates.setdefault(sid, transcript_path(sid))
+    rows = []
+    for sid, path in candidates.items():
+        if not path or sid in live_ids or sid in dismissed:
+            continue
+        meta = meta_for_path(path, cache)
+        tracked = ended.get(sid)
+        if (meta.get("entrypoint") or "").startswith("sdk"):
+            continue  # Agent SDK runs, even if an older view logged one
+        if not tracked and (meta.get("entrypoint") != "cli" or meta.get("prompts", 0) < CLOSED_MIN_PROMPTS):
+            continue
+        rows.append(dict(meta, key="c:" + sid, kind="closed", sessionId=sid,
+                         cwd=(tracked or {}).get("cwd") or meta.get("lastCwd") or HOME,
+                         statusSince=(tracked or {}).get("at") or meta["transcriptMtime"]))
+    rows.sort(key=lambda r: -r["statusSince"])
+    return rows
+
+
+GROUP_GAP = 30  # sessions ending within this many seconds of the previous one count as one group
+
+
+def restore_groups(live_ids):
+    """Every run of 2+ sessions that ended close together and aren't running again, newest first.
+
+    Chaining by gap (rather than requiring the same tick) also catches tabs closed one by one, and
+    covers every way a session ends (^x, /exit, closing the tab, Warp quitting). ENDED holds one
+    entry per session (its latest ending), so a session can only ever be in one group.
+    """
+    dismissed = set(load_json(DISMISSED, []))
+    ended = sorted((dict(e, sessionId=sid) for sid, e in load_json(ENDED, {}).items()
+                    if sid not in live_ids and sid not in dismissed),
+                   key=lambda e: e["at"])
+    runs, current = [], []
+    for e in ended:
+        if current and e["at"] - current[-1]["at"] > GROUP_GAP:
+            runs.append(current)
+            current = []
+        current.append(e)
+    if current:
+        runs.append(current)
+    groups = []
+    for members in reversed(runs):
+        batch = members[0]["at"]
+        if len(members) >= 2 and "batch:%r" % batch not in dismissed:
+            members.sort(key=lambda m: (m.get("order") or [9999, 9999], m.get("title", "")))
+            groups.append({"key": "batch:%r" % batch, "kind": "batch", "batch": batch, "members": members,
+                           "name": "Reopen all %d sessions · closed at %s"
+                                   % (len(members), time.strftime("%H:%M", time.localtime(batch))),
+                           "statusSince": max(m["at"] for m in members), "cwd": ""})
+    return groups
+
+
+def closed_section(live_ids, cache):
+    """Divider, then closed sessions newest first; each reopen-all group is one block, placed at
+    the time its sessions closed, with its sessions nested under it."""
+    closed = closed_sessions(live_ids, cache)
+    by_sid = {r["sessionId"]: r for r in closed}
+    blocks = []
+    for group in restore_groups(live_ids):
+        block = [group]
+        for i, m in enumerate(group["members"]):
+            row = by_sid.pop(m["sessionId"], None) or dict(
+                m, key="c:" + m["sessionId"], kind="closed", statusSince=m["at"])
+            row["tree"] = "└" if i == len(group["members"]) - 1 else "├"
+            block.append(row)
+        blocks.append(block)
+    blocks += [[r] for r in closed if r["sessionId"] in by_sid][:CLOSED_MAX]
+    blocks.sort(key=lambda block: -block[0]["statusSince"])
+    rows = [row for block in blocks for row in block]
+    return [{"key": "divider", "kind": "divider"}] + rows if rows else []
+
+
+_uuid_by_pid = {}
+
+
+def warp_tab_order(pids):
+    """(window, tab) position per pid, from Warp's own state DB keyed by each tab's session uuid."""
+    import sqlite3
+    db = os.path.join(HOME, "Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support",
+                      "dev.warp.Warp-Stable/warp.sqlite")
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=1)
+        tabs = {u: [w, t] for u, w, t in con.execute(
+            "select lower(hex(tp.uuid)), t.window_id, t.id from terminal_panes tp "
+            "join pane_nodes pn on pn.id = tp.id join tabs t on t.id = pn.tab_id")}
+        con.close()
+    except Exception:
+        return {}
+    order = {}
+    for pid in pids:
+        if pid not in _uuid_by_pid:
+            url = focus_url(pid) or ""
+            _uuid_by_pid[pid] = url.rsplit("/", 1)[-1].lower()
+        if _uuid_by_pid[pid] in tabs:
+            order[pid] = tabs[_uuid_by_pid[pid]]
+    return order
+
+
+def track_ended(rows):
+    now = time.time()
+    live = {r["sessionId"]: r for r in rows if r.get("kind") == "interactive" and r.get("host") == "warp"
+            and r.get("sessionId")}
+    prev = load_json(LIVE, {})
+    ended = load_json(ENDED, {})
+    gone = [sid for sid in prev.get("sessions", {}) if sid not in live]
+    if gone:
+        batch = now if now - prev.get("at", 0) < TICK_GAP else prev["at"]
+        for sid in gone:
+            ended.setdefault(sid, dict(prev["sessions"][sid], at=batch, batch=batch))
+    for sid in live:
+        ended.pop(sid, None)  # reopened
+    ended = {k: v for k, v in ended.items() if now - v["at"] < CLOSED_HOURS * 3600}
+    order = warp_tab_order([r["pid"] for r in live.values()])
+    save_json(ENDED, ended)
+    save_json(LIVE, {"at": now, "sessions": {sid: {"title": title(r), "cwd": r.get("cwd"),
+                                                    "order": order.get(r["pid"])}
+                                              for sid, r in live.items()}})
+
+
+# Where an interactive session's process lives, judged from its own command line and ancestors.
+HOSTS = (("--sdk-url", "remote"), ("/Claude.app/", "desktop"), ("/Obsidian.app/", "obsidian"),
+         ("/Warp.app/", "warp"))
+
+
+def processes():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        pid, ppid, cmd = (line.split(None, 2) + [""])[:3]
+        procs[pid] = (ppid, cmd)
+    return procs
+
+
+def host(pid, procs):
+    pid, seen = str(pid), set()
+    while pid in procs and pid not in seen and pid != "1":
+        seen.add(pid)
+        ppid, cmd = procs[pid]
+        for needle, name in HOSTS:
+            if needle in cmd:
+                return name
+        pid = ppid
+    return "other"
+
+
+def collect():
+    cache = load_json(META_CACHE, {})
+    procs = processes()
+    rows = []
+    for a in agents():
+        s = dict(a)
+        s["key"] = str(a.get("pid") or a.get("id"))
+        if a.get("kind") == "interactive" and a.get("pid"):
+            sf = load_json(os.path.join(SESSIONS_DIR, "%s.json" % a["pid"]), {})
+            s["nameSource"] = sf.get("nameSource")
+            s["statusSince"] = (sf.get("statusUpdatedAt") or 0) / 1000 or None
+            s["host"] = host(a["pid"], procs)
+        if a.get("sessionId"):
+            s.update(transcript_meta(a["sessionId"], cache))
+        if not s.get("statusSince"):
+            s["statusSince"] = s.get("transcriptMtime") or a.get("startedAt", 0) / 1000
+        if (s.get("entrypoint") or "").startswith("sdk"):
+            # Agent SDK runs (scripts, tests) aren't your sessions: shown as "sdk", never tracked
+            # as closed, and hidden in Warp-only mode.
+            s["host"] = "sdk"
+        rows.append(s)
+    rows += closed_section({r.get("sessionId") for r in rows}, cache)
+    keep = {r.get("transcript") for r in rows if r.get("transcript")}
+    save_json(META_CACHE, {k: v for k, v in cache.items() if k in keep or v["mtime"] > time.time() - CLOSED_HOURS * 3600})
+    return rows
+
+
+def title(s):
+    if s.get("kind") == "batch":
+        return s["name"]
+    if s.get("nameSource") == "user" or (s.get("kind") == "background" and s.get("name")):
+        return s.get("name")
+    return s.get("customTitle") or s.get("aiTitle") or s.get("name") or s.get("title") or "?"
+
+
+def where(s):
+    cwd = s.get("cwd", "")
+    if "/.claude/worktrees/" in cwd:
+        repo, wt = cwd.split("/.claude/worktrees/", 1)
+        return "%s ⎇ %s" % (os.path.basename(repo), wt.split("/")[0])
+    return cwd.replace(HOME, "~")
+
+
+# Idle sessions age through these buckets; a merged/closed PR marks a session "done" regardless.
+WAITING_SECONDS = 2 * 3600
+STALE_SECONDS = 2 * 86400
+
+# state: (icon, color, sort rank)
+STATES = {
+    "needs you": ("⚠", YELLOW + BOLD, 0),
+    "working": ("●", GREEN, 1),
+    "waiting": ("◆", BOLD, 2),
+    "idle": ("○", "", 3),
+    "stale": ("·", DIM, 4),
+    "done": ("✓", MAGENTA, 5),
+    "reopen all": ("↺", DIM, 6),
+    "closed": ("↺", DIM, 7),
+}
+
+
+def pr_info(s, prs):
+    pr = s.get("pr")
+    return prs.get(pr["url"], {}) if pr and pr.get("url") else {}
+
+
+def state(s, prs=None):
+    if s.get("kind") == "closed":
+        return "closed"
+    if s.get("kind") == "batch":
+        return "reopen all"
+    raw = s.get("status") or s.get("state") or "?"
+    if raw == "busy" or raw == "running":
+        return "working"
+    if raw not in ("idle", "completed"):
+        return "needs you"
+    if pr_info(s, prs or load_json(PR_CACHE, {})).get("state") in ("MERGED", "CLOSED"):
+        return "done"
+    idle = time.time() - (s.get("statusSince") or time.time())
+    return "waiting" if idle < WAITING_SECONDS else "idle" if idle < STALE_SECONDS else "stale"
+
+
+def age(seconds):
+    if seconds < 60:
+        return "now"
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= n:
+            return "%d%s" % (seconds // n, unit)
+
+
+def pr_label(s, prs):
+    """Plain text and color for the PR column, e.g. "#412 open ✓"."""
+    pr = s.get("pr")
+    if not pr or not pr.get("url"):
+        return "", ""
+    info = pr_info(s, prs)
+    st = info.get("state", "")
+    word = ("draft" if info.get("isDraft") else "open") if st == "OPEN" else st.lower()
+    review = {"APPROVED": " ✓", "CHANGES_REQUESTED": " ✗"}.get(info.get("reviewDecision"), "") if st == "OPEN" else ""
+    # Colored by what the PR needs from you, not GitHub's open/merged/closed colors.
+    if st == "OPEN":
+        color = DIM if info.get("isDraft") else {"APPROVED": GREEN, "CHANGES_REQUESTED": YELLOW}.get(
+            info.get("reviewDecision"), "")
+    else:
+        color = {"MERGED": DIM + MAGENTA, "CLOSED": DIM + RED}.get(st, DIM)
+    return ("#%s %s%s" % (pr["number"], word, review)).strip(), color
+
+
+def app(s):
+    if s.get("kind") == "background":
+        return "bg"
+    return "" if s.get("host", "warp") == "warp" else s["host"]
+
+
+def fit(text, width):
+    text = (text or "").replace("\t", " ").replace("\n", " ")
+    return text[: width - 1] + "…" if len(text) > width else text.ljust(width)
+
+
+def sort_key(s, prs):
+    return (STATES[state(s, prs)][2], -(s.get("statusSince") or 0))
+
+
+COLUMNS = "  %-10s %4s  %-42s %-15s %-9s %s"
+SECTION_KINDS = ("divider", "batch", "closed")
+
+
+def divider_line(label):
+    """A rule across the list pane; fzf exports its width as FZF_COLUMNS to commands it runs."""
+    try:
+        cols = int(os.environ.get("FZF_COLUMNS") or os.get_terminal_size(sys.__stdout__.fileno()).columns)
+    except (OSError, ValueError):
+        cols = 160
+    width = max(40, int(cols * 0.55) - 6)  # the list is ~55% of the screen, minus borders
+    side = (width - len(label) - 2) // 2
+    return "─" * side + " " + label + " " + "─" * (width - side - len(label) - 2)
+
+
+PREFS = os.path.join(CACHE_DIR, "prefs.json")
+
+
+def warp_only():
+    return load_json(PREFS, {}).get("warpOnly", False)
+
+
+def visible(rows):
+    """Drop sessions outside Warp tabs (remote, desktop, other apps, background) when ^t is on."""
+    if not warp_only():
+        return rows
+    return [r for r in rows if r.get("kind") not in ("background", "interactive") or
+            (r["kind"] == "interactive" and r.get("host") == "warp")]
+
+
+def render(rows):
+    rows = visible(rows)
+    prs = load_json(PR_CACHE, {})
+    now = time.time()
+    out = ["key\t-\t" + DIM + COLUMNS % ("STATE", "AGE", "SESSION", "PR", "APP", "WHERE") + RESET]
+    section = [r for r in rows if r.get("kind") in SECTION_KINDS]
+    live = sorted((r for r in rows if r.get("kind") not in SECTION_KINDS), key=lambda r: sort_key(r, prs))
+    for s in live + section:
+        if s["kind"] == "divider":
+            out.append("divider\tdivider\t" + DIM + divider_line("recently closed") + RESET)
+            continue
+        st = state(s, prs)
+        icon, color, _ = STATES[st]
+        icon = s.get("tree", icon)
+        faded = st in ("stale", "done", "closed", "reopen all")
+        pr_text, pr_color = pr_label(s, prs)
+        line = "%s%s %s%s %4s  %s%s%s %s%s%s %s%s %s%s" % (
+            color, icon, fit(st, 10), RESET,
+            "" if st == "working" else age(now - (s.get("statusSince") or now)),
+            DIM if faded else "", fit(title(s), 42), RESET,
+            pr_color, fit(pr_text, 15), RESET,
+            DIM, fit(app(s), 9),
+            where(s), RESET,
+        )
+        out.append("%s\t%s\t%s" % (s["key"], s.get("kind", ""), line))
+    return "\n".join(out)
+
+
+def git(cwd, *args):
+    r = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def diff_base(cwd):
+    """Merge base with the repo's default branch, or None outside a git repo."""
+    base = git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD") or next(
+        (b for b in ("origin/main", "origin/master") if git(cwd, "rev-parse", "--verify", "-q", b)), None)
+    if not base:
+        return None, None
+    mb = git(cwd, "merge-base", base, "HEAD")
+    return (base, mb) if mb else (None, None)
+
+
+def git_summary(cwd):
+    base, mb = diff_base(cwd)
+    if not mb:
+        return None
+    ahead = git(cwd, "rev-list", "--count", mb + "..HEAD") or "0"
+    stat = git(cwd, "diff", "--shortstat", mb) or "no changes"
+    dirty = len((git(cwd, "status", "--porcelain") or "").splitlines())
+    parts = ["%s commit%s ahead of %s" % (ahead, "" if ahead == "1" else "s", base), stat.strip()]
+    if dirty:
+        parts.append(YELLOW + "%d uncommitted" % dirty + RESET)
+    return " · ".join(parts)
+
+
+def cmd_diff(args):
+    s = find(args[0])
+    cwd = s.get("cwd") or HOME
+    base, mb = diff_base(cwd)
+    if not mb:
+        return pause("%s isn't a git checkout" % cwd.replace(HOME, "~"))
+    # Committed and uncommitted changes against the default branch; untracked files listed on top.
+    pretty = " | diff-so-fancy" if shutil.which("diff-so-fancy") else ""
+    cmd = "{{ git -C {cwd} status --short --untracked-files=all; echo; git -C {cwd} diff --color=always {mb}{pretty}; }} | less -R"
+    subprocess.run(cmd.format(cwd=shlex.quote(cwd), mb=mb, pretty=pretty), shell=True)
+
+
+def cmd_code(args):
+    s = find(args[0])
+    if not s.get("cwd"):
+        return
+    subprocess.run(["code", s.get("cwd") or HOME])
+
+
+def refresh_prs(rows):
+    urls = {r["pr"]["url"] for r in rows if r.get("pr") and r["pr"].get("url")}
+    if not urls or not shutil.which("gh"):
+        return
+    prs = load_json(PR_CACHE, {})
+
+    def fetch(url):
+        try:
+            out = subprocess.run(["gh", "pr", "view", url, "--json", "state,isDraft,reviewDecision,title"],
+                                 capture_output=True, text=True, timeout=20).stdout
+            return url, json.loads(out)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return url, None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for url, info in pool.map(fetch, urls):
+            if info:
+                prs[url] = info
+    save_json(PR_CACHE, {u: v for u, v in prs.items() if u in urls})
+
+
+# Inside the view, the ticker keeps a snapshot of the rows so the preview and key actions don't
+# have to re-collect everything (which takes ~0.5s) on every cursor move.
+SNAPSHOT_MAX_AGE = 15
+
+
+def listing_path():
+    return os.path.join(CACHE_DIR, "list-%s.txt" % os.environ.get("CCTOP_UI", os.getpid()))
+
+
+def snapshot_path():
+    return os.path.join(CACHE_DIR, "snapshot-%s.json" % os.environ.get("CCTOP_UI", "cli"))
+
+
+def snapshot_rows():
+    snap = load_json(snapshot_path(), {}) if os.environ.get("CCTOP_UI") else {}
+    if time.time() - snap.get("at", 0) < SNAPSHOT_MAX_AGE:
+        return snap["rows"]
+    return collect()
+
+
+def find(key):
+    for s in snapshot_rows():
+        if s["key"] == key:
+            return s
+    sys.exit("cctop: no session %s (it may have exited)" % key)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(_):
+    try:
+        print(render(collect()))
+    except AgentsUnavailable:
+        print(render([]))  # header only; the next refresh fills it in
+
+
+def cmd_preview(args):
+    s = find(args[0])
+    if s.get("kind") == "divider":
+        print(DIM + "Sessions that ended in the last %d hours, plus any group that closed together\n"
+              "(a Warp quit or restart). enter reopens; ^x removes from this list." % CLOSED_HOURS + RESET)
+        return
+    if s.get("kind") == "batch":
+        print(BOLD + title(s) + RESET + "\n")
+        when = age(time.time() - s["batch"])
+        print(DIM + "ended together %s; enter reopens each in a new tab, in their old tab order\n"
+              % ("just now" if when == "now" else when + " ago") + RESET)
+        for m in s["members"]:
+            print("↺ %s  %s%s%s" % (m.get("title"), DIM, (m.get("cwd") or "").replace(HOME, "~"), RESET))
+        return
+    prs = load_json(PR_CACHE, {})
+    width = max(40, int(os.environ.get("FZF_PREVIEW_COLUMNS", "80")) - 2)
+    since = s.get("statusSince")
+    print(BOLD + title(s) + RESET)
+    if s.get("aiTitle") and s.get("aiTitle") != title(s):
+        print(DIM + "latest topic: " + s["aiTitle"] + RESET)
+    print()
+    for label, value in (
+        ("state", state(s) if state(s) == "working" or not since
+                  else "%s %s ago" % (state(s), age(time.time() - since)) if state(s) == "closed"
+                  else "%s · last active %s ago" % (state(s), age(time.time() - since))),
+        ("app", None if s.get("kind") == "closed" else app(s) or "warp"),
+        ("kind", s.get("kind")),
+        ("where", s.get("cwd", "").replace(HOME, "~")),
+        ("branch", s.get("branch")),
+        ("changes", git_summary(s.get("cwd") or HOME)),
+        ("pr", "%s%s%s  %s" % (pr_label(s, prs)[1], pr_label(s, prs)[0], RESET, s["pr"]["url"]) if s.get("pr") else None),
+        ("pid", s.get("pid")),
+        ("session", s.get("sessionId")),
+        ("resume", resume_hint(s) if s.get("kind") == "closed" else None),
+    ):
+        if value:
+            print("%s%-8s%s %s" % (DIM, label, RESET, value))
+    for label, body, limit in (("you", s.get("lastPrompt"), 6), ("claude", s.get("lastReply"), 30)):
+        if body:
+            print("\n" + BLUE + BOLD + label + RESET)
+            lines = [l for p in body.strip().splitlines() for l in (textwrap.wrap(p, width) or [""])]
+            print("\n".join(lines[:limit]) + ("\n" + DIM + "…" + RESET if len(lines) > limit else ""))
+
+
+def set_tab_title(tty, text):
+    try:
+        with open(tty, "w") as t:
+            t.write("\033]0;%s\007" % text)
+    except OSError:
+        pass
+
+
+def focus_url(pid):
+    """Warp exports a per-session focus deeplink (warp://session/<uuid>) into every tab's env."""
+    env = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    for word in env.split():
+        if word.startswith("WARP_FOCUS_URL="):
+            return word.split("=", 1)[1]
+
+
+def cmd_jump(args):
+    s = find(args[0])
+    if s.get("kind") == "background":
+        return cmd_attach(args)
+    url = focus_url(s["pid"])
+    if s.get("host") == "remote":
+        # Remote Control workers inherit the env of the tab running `claude remote-control`.
+        return pause("remote session: open it from claude.ai/code or the Claude app"
+                     + (" (it's hosted by the `claude remote-control` tab)" if url else ""))
+    if not url:
+        return pause("session %s isn't in a Warp tab (it runs in %s)" % (s["pid"], s.get("host", "another app")))
+    subprocess.run(["open", url])
+
+
+def pause(message):
+    print("cctop: %s\n(press enter)" % message, flush=True)
+    sys.stdin.readline()
+
+
+def cmd_close(args):
+    s = find(args[0])
+    print("\nClose %s%s%s (%s)? This stops the Claude process; the conversation stays resumable. [y/N] "
+          % (BOLD, title(s), RESET, where(s)), end="", flush=True)
+    if sys.stdin.readline().strip().lower() == "y":
+        stop_session(s)
+
+
+SHELLS = ("zsh", "bash", "fish", "sh")
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+
+
+def stop_session(s):
+    """Stop the session; for one in a Warp tab, also end the tab's shell so Warp closes the tab."""
+    if s.get("kind") == "background":
+        subprocess.run(["claude", "stop", s["id"]])
+        return
+    pid = int(s["pid"])
+    # The row may be seconds old; make sure the PID still belongs to this session, not a reused one.
+    if load_json(os.path.join(SESSIONS_DIR, "%d.json" % pid), {}).get("sessionId") != s.get("sessionId"):
+        return
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    if "claude" not in command:
+        return
+    ppid, tty = (subprocess.run(["ps", "-o", "ppid=,tty=", "-p", str(pid)], capture_output=True, text=True)
+                 .stdout.split() + ["", ""])[:2]
+    parent = subprocess.run(["ps", "-o", "tty=,comm=", "-p", ppid or "0"], capture_output=True, text=True).stdout.split()
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    # Let Claude exit cleanly (it flushes the transcript) before the shell goes away.
+    deadline = time.time() + 5
+    while alive(pid) and time.time() < deadline:
+        time.sleep(0.1)
+    # Only the interactive shell that launched Claude in this same tab, never anything else.
+    if (s.get("host") == "warp" and not alive(pid) and len(parent) == 2 and parent[0] == tty
+            and os.path.basename(parent[1]).lstrip("-") in SHELLS):
+        try:
+            os.kill(int(ppid), signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+
+
+def cmd_attach(args):
+    s = find(args[0])
+    if s.get("kind") != "background":
+        return cmd_jump(args)
+    subprocess.run(["claude", "attach", s["id"]])
+
+
+def cmd_open_pr(args):
+    s = find(args[0])
+    if s.get("pr") and s["pr"].get("url"):
+        subprocess.run(["open", s["pr"]["url"]])
+
+
+def post(sock_path, action):
+    body = action.encode()
+    req = b"POST / HTTP/1.1\r\nHost: fzf\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        s.connect(sock_path)
+        s.sendall(req)
+        s.recv(1024)
+
+
+# ---------------------------------------------------------------- in-view actions
+# Keys in the view run `cctop act <verb> <id>` through fzf's transform, which prints fzf actions.
+# Results go to a status line in the footer, above the key reference, until the next one.
+
+KEYS = (("enter", "jump/reopen"), ("^n", "new"), ("^o", "pr"), ("^e", "vs code"), ("^d", "diff"), ("^x", "close"),
+        ("?", "help"))
+PROMPT = "cctop> "
+
+
+def footer(status=""):
+    keys = "   ".join("%s%s%s %s%s%s" % (CYAN, k, RESET, DIM, label, RESET) for k, label in KEYS)
+    return "%s\n%s" % (status, keys)
+
+
+def status(message, color=""):
+    return "change-footer:" + footer("%s%s%s" % (color, message, RESET))
+
+
+def resume_hint(s):
+    if s.get("kind") == "background":
+        return "claude attach %s" % s["id"]
+    # A session id resumes from any directory, and re-enters its worktree if it still exists.
+    return "claude -r %s" % s.get("sessionId")
+
+
+def resume_dir(s):
+    """The session's last directory, or its repo root if that was a worktree since removed."""
+    cwd = s.get("cwd") or HOME
+    if not os.path.isdir(cwd) and "/.claude/worktrees/" in cwd:
+        cwd = cwd.split("/.claude/worktrees/", 1)[0]
+    return cwd if os.path.isdir(cwd) else HOME
+
+
+def background(*args):
+    subprocess.Popen(list(args), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+REOPENING = os.path.join(CACHE_DIR, "reopening.json")
+REOPEN_GRACE = 30  # seconds a reopened session may take to show up as running again
+
+
+def claim_reopen(session_ids):
+    """Mark sessions as reopening; False if any already is (a repeated enter)."""
+    now = time.time()
+    pending = {k: v for k, v in load_json(REOPENING, {}).items() if now - v < REOPEN_GRACE}
+    if any(sid in pending for sid in session_ids):
+        return False
+    pending.update({sid: now for sid in session_ids})
+    save_json(REOPENING, pending)
+    return True
+
+
+def act_jump(s, me):
+    if s.get("kind") == "batch":
+        if not claim_reopen([m["sessionId"] for m in s["members"]]):
+            return status("Already reopening these sessions", YELLOW)
+        background(me, "reopen-all", repr(s["batch"]))
+        return status("Reopening %d sessions in new tabs" % len(s["members"]), GREEN)
+    if s.get("kind") == "closed":
+        if not claim_reopen([s["sessionId"]]):
+            return status("Already reopening “%s”" % title(s), YELLOW)
+        # Opening a tab waits for Warp to index the config, so do it in the background.
+        background(me, "reopen", s["sessionId"], resume_dir(s), title(s))
+        return status("Reopening “%s” in a new tab" % title(s), GREEN)
+    if s.get("kind") == "background":
+        return "execute(%s attach %s)" % (me, s["key"])
+    if s.get("host") == "remote":
+        return status("“%s” is a remote session: open it from claude.ai/code or the Claude app" % title(s), YELLOW)
+    url = focus_url(s["pid"])
+    if not url:
+        return status("“%s” isn't in a Warp tab (it runs in %s)" % (title(s), s.get("host", "another app")), YELLOW)
+    subprocess.run(["open", url])
+    return ""
+
+
+def act_close(s, me):
+    if s.get("kind") in ("closed", "batch"):
+        save_json(DISMISSED, load_json(DISMISSED, []) + [s["key"] if s["kind"] == "batch" else s["sessionId"]])
+        return status("Removed “%s” from the list (conversations are kept)" % title(s))
+    # Stopping waits for Claude to exit, so do it in the background; the ticker drops the row.
+    background(me, "stop", s["key"])
+    tab = " and its tab" if s.get("host") == "warp" else ""
+    return status("Closed “%s”%s · reopen it from recently closed" % (title(s), tab), MAGENTA)
+
+
+def act_diff(s, me):
+    if not diff_base(s.get("cwd") or HOME)[1]:
+        return status("%s isn't a git checkout" % (s.get("cwd") or HOME).replace(HOME, "~"), YELLOW)
+    return "execute(%s diff %s)" % (me, s["key"])
+
+
+def act_filter(s, me):
+    save_json(PREFS, dict(load_json(PREFS, {}), warpOnly=not warp_only()))
+    rows = snapshot_rows()
+    with open(listing_path(), "w") as f:
+        f.write(render(rows) + "\n")
+    message = ("Showing only sessions in Warp tabs" if warp_only()
+               else "Showing all sessions, including remote, desktop and background")
+    return "reload-sync(cat %s)+change-list-label(%s)+%s" % (
+        shlex.quote(listing_path()), list_label(rows), status(message))
+
+
+def act_new(s, me):
+    cwd = new_session_dir(s)
+    background(me, "new", cwd)
+    return status("Starting a new session in %s" % cwd.replace(HOME, "~"), GREEN)
+
+
+ACTIONS = {"jump": act_jump, "close": act_close, "diff": act_diff, "filter": act_filter, "new": act_new}
+
+
+TAB_CONFIGS = os.path.join(HOME, ".warp", "tab_configs")
+
+
+def toml_str(value):
+    """A TOML basic string. JSON escaping matches TOML's except that ensure_ascii would write
+    emoji as surrogate pairs, which TOML rejects; control characters are dropped outright."""
+    return json.dumps("".join(c for c in value if c >= " " and c != "\x7f"), ensure_ascii=False)
+
+
+def write_tab_config(session_id, cwd, name, command=None, config=None):
+    """A throwaway Warp tab config that runs Claude in a new tab (the mechanism /spawn-session
+    uses); by default it resumes the given session."""
+    os.makedirs(TAB_CONFIGS, exist_ok=True)
+    config = config or "cctop-resume-%s" % session_id
+    with open(os.path.join(TAB_CONFIGS, config + ".toml"), "w") as f:
+        f.write('name = %s\n\n[[panes]]\nid = "main"\ntype = "terminal"\ndirectory = %s\ncommands = [%s]\n'
+                % (toml_str("claude: " + name), toml_str(cwd), toml_str(command or "claude -r " + session_id)))
+    return config
+
+
+def open_tab_configs(configs):
+    time.sleep(1)  # let Warp's file watcher index the configs before the URIs ask for them
+    for config in configs:
+        subprocess.run(["open", "warp://tab_config/" + config])
+        time.sleep(0.5)  # keep the tabs in order
+    time.sleep(15)
+    for config in configs:
+        try:
+            os.unlink(os.path.join(TAB_CONFIGS, config + ".toml"))
+        except OSError:
+            pass
+
+
+HELP = """{b}Keys{r}
+  enter      jump to the session's tab · reopen a closed one · attach to a background one
+  ^o         open the session's PR in the browser
+  ^e         open the session's folder in VS Code
+  ^d         page through its changes against the default branch
+  ^n         start a new session in a new tab, in the selected session's folder
+  ^x         close the session and its tab · on a closed row, remove it from the list
+  ^r         refresh now
+  ^t         toggle between all sessions and only those in Warp tabs
+  ^l         redraw the screen
+  ^c ^q      quit cctop
+  ? or ^?    this help
+
+{b}Moving{r}
+  ↑ ↓        move (also ^k ^j)
+  pgup pgdn  move a page
+  ⇧↑ ⇧↓      scroll the preview
+
+{b}Mouse{r}
+  scroll     scroll the list or the preview, whichever is under the pointer
+  click      select a row
+  dbl-click  same as enter: jump to or reopen the session
+
+{b}Search{r}
+  type       filter the list
+  ^w         delete a word (Option+Backspace doesn't reach cctop in Warp)
+  ^u         clear the search (Cmd+Backspace doesn't either)
+  esc        clear the search
+
+{b}States{r}
+  ⚠ needs you   blocked on a prompt
+  ● working     Claude is busy
+  ◆ waiting     finished under 2h ago; probably your turn
+  ○ idle        no activity for 2h to 2 days
+  · stale       no activity for over 2 days
+  ✓ done        its PR is merged or closed
+  ↺ closed      ended in the last 24h; reopen-all groups sessions that closed together
+
+{d}Move the cursor to return to the session preview.{r}"""
+
+
+def cmd_help(_):
+    print(HELP.format(b=BOLD, d=DIM, r=RESET))
+
+
+def new_session_dir(s):
+    """The selected row's folder (a worktree's main repo), or where cctop was started."""
+    cwd = (s or {}).get("cwd") or os.environ.get("CCTOP_HOME") or HOME
+    if "/.claude/worktrees/" in cwd:
+        cwd = cwd.split("/.claude/worktrees/", 1)[0]
+    return cwd if os.path.isdir(cwd) else HOME
+
+
+def cmd_new(args):
+    open_tab_configs([write_tab_config(None, args[0], "new session", command="claude",
+                                       config="cctop-new-%d" % os.getpid())])
+
+
+def cmd_reopen(args):
+    session_id, cwd, name = args
+    open_tab_configs([write_tab_config(session_id, cwd, name)])
+
+
+def cmd_reopen_all(args):
+    try:
+        groups = restore_groups({a.get("sessionId") for a in agents()})
+    except AgentsUnavailable:
+        return
+    for group in groups:
+        if repr(group["batch"]) == args[0]:
+            open_tab_configs([write_tab_config(m["sessionId"], resume_dir(m), m.get("title") or "session")
+                              for m in group["members"]])
+
+
+def cmd_act(args):
+    verb, key = args
+    if verb == "filter":
+        print(act_filter(None, os.path.realpath(sys.argv[0])))
+        return
+    if key == "divider":
+        if verb == "new":
+            print(act_new(None, os.path.realpath(sys.argv[0])))
+        return
+    for s in snapshot_rows():
+        if s["key"] == key:
+            print(ACTIONS[verb](s, os.path.realpath(sys.argv[0])))
+            return
+    print(status("that session has already exited", YELLOW))
+
+
+def cmd_stop(args):
+    stop_session(find(args[0]))
+
+
+def list_label(rows):
+    """Counts for the list border, in place of fzf's counter, which would include closed rows."""
+    rows = visible(rows)
+    name = "warp sessions" if warp_only() else "sessions"
+    if not rows:
+        return " %s " % name
+    open_count = sum(1 for r in rows if r.get("kind") not in SECTION_KINDS)
+    closed = sum(1 for r in rows if r.get("kind") == "closed")
+    return " %s · %d open%s " % (name, open_count, " · %d closed" % closed if closed else "")
+
+
+FZF_MIN = (0, 71)  # --id-nth, which keeps the cursor on the same session across refreshes
+
+
+def check_requirements():
+    problems = []
+    if sys.platform != "darwin":
+        problems.append("cctop only runs on macOS")
+    if not shutil.which("claude"):
+        problems.append("the Claude Code CLI (claude) isn't on your PATH")
+    fzf = shutil.which("fzf")
+    if not fzf:
+        problems.append("fzf isn't installed (brew install fzf)")
+    else:
+        out = subprocess.run([fzf, "--version"], capture_output=True, text=True).stdout
+        version = tuple(int(n) for n in out.split()[0].split(".")[:2]) if out else (0, 0)
+        if version < FZF_MIN:
+            problems.append("fzf %s or newer is needed, found %s (brew upgrade fzf)"
+                            % (".".join(map(str, FZF_MIN)), out.split()[0] if out else "unknown"))
+    if not os.environ.get("WARP_FOCUS_URL"):
+        print("cctop: not running in Warp; jumping to tabs, closing tabs and reopening won't work",
+              file=sys.stderr)
+    if problems:
+        sys.exit("cctop: " + "; ".join(problems))
+
+
+def cmd_ui(_):
+    check_requirements()
+    me = os.path.realpath(sys.argv[0])
+    sock = os.path.join(tempfile.gettempdir(), "cctop-%d.sock" % os.getpid())
+    os.environ["CCTOP_UI"] = str(os.getpid())
+    os.environ["CCTOP_HOME"] = os.getcwd()  # default folder for ^n
+    stop = threading.Event()
+
+    listing = listing_path()
+    # Per-view files from views that were killed rather than quit.
+    for path in glob.glob(os.path.join(CACHE_DIR, "*-[0-9]*.*")):
+        owner = os.path.basename(path).split("-", 1)[1].split(".")[0]
+        if owner.isdigit() and not alive(int(owner)):
+            os.unlink(path)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
+
+    def ticker():
+        # Collect off fzf's thread and only reload when the rendered list changed; the reload itself
+        # is then just a `cat`, so fzf is never left waiting on a slow command while you type.
+        last_pr, last_text = 0, initial_text
+        while not stop.wait(REFRESH_SECONDS):
+            try:
+                rows = collect()
+                track_ended(rows)
+                save_json(snapshot_path(), {"at": time.time(), "rows": rows})
+                text = render(rows)
+                if text != last_text:
+                    with open(listing, "w") as f:
+                        f.write(text + "\n")
+                    post(sock, "reload-sync(cat %s)+refresh-preview+change-list-label:%s"
+                         % (shlex.quote(listing), list_label(rows)))
+                    last_text = text
+                if time.time() - last_pr > PR_REFRESH_SECONDS:
+                    last_pr = time.time()
+                    threading.Thread(target=refresh_prs, args=(rows,), daemon=True).start()
+            except Exception:
+                # Keep ticking; a missed refresh is harmless. Log it for debugging.
+                import traceback
+                with open(os.path.join(CACHE_DIR, "errors.log"), "a") as f:
+                    f.write(time.strftime("%H:%M:%S ") + traceback.format_exc())
+
+    # Build the first list here, where the terminal size is known (fzf's own start-up command can't
+    # see it, so the divider would be drawn at a guessed width until the first refresh).
+    try:
+        rows = collect()
+    except AgentsUnavailable:
+        rows = []
+    initial_text = render(rows)
+    with open(listing, "w") as f:
+        f.write(initial_text + "\n")
+    threading.Thread(target=ticker, daemon=True).start()
+    set_tab_title("/dev/tty", "cctop")
+    try:
+        subprocess.run([
+            "fzf", "--color=bg+:#1f4060,pointer:#66d9ef", "--pointer=▌", "--ansi", "--delimiter=\t", "--with-nth=3..", "--id-nth=1", "--track",
+            "--no-sort", "--layout=reverse", "--no-multi", "--listen=" + sock,
+            "--prompt=" + PROMPT, "--info=inline-right", "--input-border=rounded",
+            "--list-border=rounded", "--list-label=" + list_label(rows), "--highlight-line",
+            "--header-lines=1", "--header-lines-border=bottom",
+            "--footer=" + footer(), "--footer-border=none",
+            "--preview=%s preview {1}" % me, "--preview-window=right,45%,wrap,border-rounded",
+            "--bind=start:reload-sync(cat %s)" % shlex.quote(listing),
+            "--bind=enter:transform(%s act jump {1})" % me,
+            "--bind=ctrl-o:execute-silent(%s open-pr {1})" % me,
+            "--bind=ctrl-e:execute-silent(%s code {1})" % me,
+            "--bind=ctrl-d:transform(%s act diff {1})" % me,
+            "--bind=ctrl-x:transform(%s act close {1})" % me,
+            "--bind=ctrl-r:reload-sync(%s list)+refresh-preview" % me,
+            "--bind=ctrl-t:transform(%s act filter {1})" % me,
+            "--bind=ctrl-n:transform(%s act new {1})" % me,
+            "--bind=ctrl-p:ignore",  # fzf's default "up"; its pair ^n now starts a session
+            "--bind=ctrl-g:ignore",  # fzf's default quits; too easy to hit by accident
+            "--bind=esc:clear-query",
+            "--bind=?,ctrl-/:change-preview(%s help)+change-preview-label( help )" % me,
+            "--bind=focus:change-preview(%s preview {1})+change-preview-label()" % me,
+        ] + [
+            # Step over the "recently closed" divider: move again if the move landed on it.
+            "--bind=%s:%s+transform([ {1} = divider ] && echo %s || true)" % (key, move, move)
+            for keys, move in (("down,ctrl-j", "down"), ("up,ctrl-k", "up"))
+            for key in keys.split(",")
+        ], stdin=subprocess.DEVNULL)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        stop.set()
+        for path in (sock, snapshot_path(), listing):
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+COMMANDS = {
+    "list": cmd_list, "preview": cmd_preview, "jump": cmd_jump, "close": cmd_close,
+    "attach": cmd_attach, "open-pr": cmd_open_pr, "code": cmd_code, "diff": cmd_diff, "act": cmd_act, "stop": cmd_stop, "reopen": cmd_reopen, "new": cmd_new, "help": cmd_help, "reopen-all": cmd_reopen_all, "ui": cmd_ui,
+}
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+    elif not argv:
+        cmd_ui([])
+    elif argv[0] in COMMANDS:
+        COMMANDS[argv[0]](argv[1:])
+    else:
+        sys.exit(__doc__.strip())
