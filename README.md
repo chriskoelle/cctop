@@ -25,7 +25,7 @@ A live dashboard of your running [Claude Code](https://claude.com/claude-code) s
 - macOS
 - [Warp](https://www.warp.dev) (the Stable channel). The list works in other terminals, but jumping to tabs,
   closing tabs and reopening don't.
-- Python 3.8+
+- Python 3 (tested on 3.15)
 - [fzf](https://github.com/junegunn/fzf) 0.71 or newer
 - The Claude Code CLI (`claude`)
 - Optional: [`gh`](https://cli.github.com) for PR states, VS Code's `code` command, `diff-so-fancy` for nicer
@@ -37,13 +37,16 @@ A live dashboard of your running [Claude Code](https://claude.com/claude-code) s
 
 ```sh
 git clone https://github.com/chriskoelle/cctop.git ~/src/cctop
+mkdir -p ~/.local/bin
 ln -s ~/src/cctop/cctop ~/.local/bin/cctop
 ```
+
+If `~/.local/bin` isn't on your `PATH` yet, add `export PATH="$HOME/.local/bin:$PATH"` to your `~/.zshrc`.
 
 Then run `cctop` in a Warp tab and pin it.
 
 To see what it looks like without any sessions running, `CCTOP_DEMO=1 cctop` shows made-up sessions. It
-doesn't read or change anything, and key actions are turned off.
+doesn't read your sessions or touch Claude Code or Warp files, and key actions are turned off.
 
 ## How it works, and what can break
 

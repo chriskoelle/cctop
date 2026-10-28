@@ -15,7 +15,7 @@
 Sessions come from `claude agents --json`; titles, branch, PR and last messages from each
 session's transcript tail. PR states are fetched with `gh` in the background and cached.
 
-Requires macOS, Warp, Python 3.8+, fzf 0.71+ and the Claude Code CLI; `gh`, VS Code's `code` and
+Requires macOS, Warp, Python 3 (tested on 3.15), fzf 0.71+ and the Claude Code CLI; `gh`, VS Code's `code` and
 diff-so-fancy are optional. Parts of it read Claude Code and Warp files that aren't documented
 interfaces, so an update to either can break things.
 """
