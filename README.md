@@ -3,18 +3,7 @@
 A live dashboard of your running [Claude Code](https://claude.com/claude-code) sessions, built for a pinned
 [Warp](https://www.warp.dev) tab. Think `ctop`, but for Claude sessions.
 
-```
-  STATE       AGE  SESSION                                    PR              APP       WHERE
-● working          Add rate limiting to the public API        #412 open ✓               api ⎇ rate-limits
-◆ waiting     12m  Fix flaky checkout test                                              ~/src/shop
-○ idle         6h  Review dependency upgrade PR                                         ~/src/shop
-· stale        5d  Speed up search index rebuild              #398 open                 api ⎇ search-index
-✓ done         4d  Docs for the webhooks endpoint             #387 merged               ~/src/api
-──────────────────────────────── recently closed ────────────────────────────────
-↺ reopen all  2m  Reopen all 2 sessions · closed at 18:26
-├ closed      2m  Migrate CI to the new runners
-└ closed      2m  Investigate memory spike
-```
+![cctop showing running, idle, stale and recently closed Claude Code sessions](docs/screenshot.png)
 
 ## What it does
 
@@ -52,6 +41,9 @@ ln -s ~/src/cctop/cctop ~/.local/bin/cctop
 ```
 
 Then run `cctop` in a Warp tab and pin it.
+
+To see what it looks like without any sessions running, `CCTOP_DEMO=1 cctop` shows made-up sessions. It
+doesn't read or change anything, and key actions are turned off.
 
 ## How it works, and what can break
 

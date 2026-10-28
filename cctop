@@ -279,6 +279,8 @@ def warp_tab_order(pids):
 
 
 def track_ended(rows):
+    if DEMO:
+        return
     now = time.time()
     live = {r["sessionId"]: r for r in rows if r.get("kind") == "interactive" and r.get("host") == "warp"
             and r.get("sessionId")}
@@ -297,6 +299,78 @@ def track_ended(rows):
     save_json(LIVE, {"at": now, "sessions": {sid: {"title": title(r), "cwd": r.get("cwd"),
                                                     "order": order.get(r["pid"])}
                                               for sid, r in live.items()}})
+
+
+# ---------------------------------------------------------------- demo mode
+# CCTOP_DEMO=1 shows made-up sessions (for screenshots); nothing is read from or written to
+# Claude Code's files, and key actions are turned off.
+DEMO = bool(os.environ.get("CCTOP_DEMO"))
+
+
+def pr_cache():
+    return DEMO_PRS if DEMO else load_json(PR_CACHE, {})
+
+
+def demo_pr(number):
+    return {"number": number, "url": "https://github.com/example/app/pull/%d" % number}
+
+
+DEMO_PRS = {
+    demo_pr(412)["url"]: {"state": "OPEN", "isDraft": False, "reviewDecision": "APPROVED"},
+    demo_pr(415)["url"]: {"state": "OPEN", "isDraft": False, "reviewDecision": "CHANGES_REQUESTED"},
+    demo_pr(398)["url"]: {"state": "OPEN", "isDraft": False, "reviewDecision": "REVIEW_REQUIRED"},
+    demo_pr(387)["url"]: {"state": "MERGED", "isDraft": False, "reviewDecision": "APPROVED"},
+}
+
+
+def demo_rows():
+    now = time.time()
+    src = os.path.join(HOME, "src")
+    wt = lambda repo, name: os.path.join(src, repo, ".claude", "worktrees", name)
+
+    def live(n, name, minutes, status="idle", cwd=None, pr=None, host="warp", **extra):
+        return dict({"key": str(90000 + n), "pid": 90000 + n, "kind": "interactive", "host": host,
+                     "status": status, "sessionId": "demo-%d" % n, "name": name, "nameSource": "user",
+                     "statusSince": now - minutes * 60, "cwd": cwd or os.path.join(src, "api"),
+                     "pr": demo_pr(pr) if pr else None}, **extra)
+
+    rows = [
+        live(1, "Add rate limiting to the public API", 0, "busy", wt("api", "rate-limits"), 412,
+             branch="rate-limits", changes="4 commits ahead of origin/main · 9 files changed, 312 insertions(+)",
+             lastPrompt="Add per-key rate limits to the public API, with a 429 and Retry-After when exceeded.",
+             lastReply="Rate limiting is in and the PR is approved. Each API key gets a token bucket in "
+                       "Redis; requests over the limit get a 429 with a Retry-After header.\n\nI added "
+                       "tests for the limit, the reset and the header. Next I'm updating the API docs."),
+        {"key": "a1b2c3d4", "id": "a1b2c3d4", "kind": "background", "state": "blocked",
+         "name": "Nightly dependency audit", "statusSince": now - 25 * 60, "cwd": os.path.join(src, "shop"),
+         "sessionId": "demo-bg"},
+        live(2, "Fix flaky checkout test", 12, cwd=os.path.join(src, "shop"), branch="main",
+             lastPrompt="The checkout spec fails about 1 in 20 runs on CI. Find out why.",
+             lastReply="It's a race: the test asserts on the order total before the async tax calculation "
+                       "finishes. Want me to wait on the tax request instead of sleeping?"),
+        live(3, "Write migration for order archive", 48, cwd=wt("shop", "order-archive"), pr=415,
+             branch="order-archive"),
+        live(4, "Plan search roadmap", 6 * 60, host="remote", cwd=src),
+        live(5, "Investigate slow dashboard queries", 26 * 60),
+        live(6, "Speed up search index rebuild", 5 * 1440, cwd=wt("api", "search-index"), pr=398),
+        live(7, "Prototype CSV import", 9 * 1440, cwd=os.path.join(src, "shop")),
+        live(8, "Docs for the webhooks endpoint", 4 * 1440, pr=387),
+    ]
+    batch = now - 130
+    members = [{"sessionId": "demo-c%d" % i, "title": t, "cwd": os.path.join(src, "api"), "at": batch + i}
+               for i, t in enumerate(("Migrate CI to the new runners", "Investigate memory spike"))]
+    rows += [
+        {"key": "divider", "kind": "divider"},
+        {"key": "batch:%r" % batch, "kind": "batch", "batch": batch, "members": members, "cwd": "",
+         "name": "Reopen all 2 sessions · closed at %s" % time.strftime("%H:%M", time.localtime(batch)),
+         "statusSince": batch + 1},
+    ]
+    for i, m in enumerate(members):
+        rows.append(dict(m, key="c:" + m["sessionId"], kind="closed", statusSince=m["at"],
+                         tree="└" if i == len(members) - 1 else "├"))
+    rows.append({"key": "c:demo-c9", "kind": "closed", "sessionId": "demo-c9", "title": "Tidy up logging config",
+                 "cwd": os.path.join(src, "shop"), "statusSince": now - 40 * 60})
+    return rows
 
 
 # Where an interactive session's process lives, judged from its own command line and ancestors.
@@ -326,6 +400,8 @@ def host(pid, procs):
 
 
 def collect():
+    if DEMO:
+        return demo_rows()
     cache = load_json(META_CACHE, {})
     procs = processes()
     rows = []
@@ -400,7 +476,7 @@ def state(s, prs=None):
         return "working"
     if raw not in ("idle", "completed"):
         return "needs you"
-    if pr_info(s, prs or load_json(PR_CACHE, {})).get("state") in ("MERGED", "CLOSED"):
+    if pr_info(s, prs or pr_cache()).get("state") in ("MERGED", "CLOSED"):
         return "done"
     idle = time.time() - (s.get("statusSince") or time.time())
     return "waiting" if idle < WAITING_SECONDS else "idle" if idle < STALE_SECONDS else "stale"
@@ -466,7 +542,7 @@ PREFS = os.path.join(CACHE_DIR, "prefs.json")
 
 
 def warp_only():
-    return load_json(PREFS, {}).get("warpOnly", False)
+    return False if DEMO else load_json(PREFS, {}).get("warpOnly", False)
 
 
 def visible(rows):
@@ -479,7 +555,7 @@ def visible(rows):
 
 def render(rows):
     rows = visible(rows)
-    prs = load_json(PR_CACHE, {})
+    prs = pr_cache()
     now = time.time()
     out = ["key\t-\t" + DIM + COLUMNS % ("STATE", "AGE", "SESSION", "PR", "APP", "WHERE") + RESET]
     section = [r for r in rows if r.get("kind") in SECTION_KINDS]
@@ -553,10 +629,12 @@ def cmd_code(args):
 
 
 def refresh_prs(rows):
+    if DEMO:
+        return
     urls = {r["pr"]["url"] for r in rows if r.get("pr") and r["pr"].get("url")}
     if not urls or not shutil.which("gh"):
         return
-    prs = load_json(PR_CACHE, {})
+    prs = pr_cache()
 
     def fetch(url):
         try:
@@ -623,7 +701,7 @@ def cmd_preview(args):
         for m in s["members"]:
             print("↺ %s  %s%s%s" % (m.get("title"), DIM, (m.get("cwd") or "").replace(HOME, "~"), RESET))
         return
-    prs = load_json(PR_CACHE, {})
+    prs = pr_cache()
     width = max(40, int(os.environ.get("FZF_PREVIEW_COLUMNS", "80")) - 2)
     since = s.get("statusSince")
     print(BOLD + title(s) + RESET)
@@ -638,7 +716,7 @@ def cmd_preview(args):
         ("kind", s.get("kind")),
         ("where", s.get("cwd", "").replace(HOME, "~")),
         ("branch", s.get("branch")),
-        ("changes", git_summary(s.get("cwd") or HOME)),
+        ("changes", s.get("changes") or git_summary(s.get("cwd") or HOME)),
         ("pr", "%s%s%s  %s" % (pr_label(s, prs)[1], pr_label(s, prs)[0], RESET, s["pr"]["url"]) if s.get("pr") else None),
         ("pid", s.get("pid")),
         ("session", s.get("sessionId")),
@@ -985,6 +1063,9 @@ def cmd_reopen_all(args):
 
 def cmd_act(args):
     verb, key = args
+    if DEMO:
+        print(status("Demo mode: actions are turned off", YELLOW))
+        return
     if verb == "filter":
         print(act_filter(None, os.path.realpath(sys.argv[0])))
         return
@@ -1113,6 +1194,7 @@ def cmd_ui(_):
             "--bind=ctrl-p:ignore",  # fzf's default "up"; its pair ^n now starts a session
             "--bind=ctrl-g:ignore",  # fzf's default quits; too easy to hit by accident
             "--bind=esc:clear-query",
+        ] + [
             "--bind=?,ctrl-/:change-preview(%s help)+change-preview-label( help )" % me,
             "--bind=focus:change-preview(%s preview {1})+change-preview-label()" % me,
         ] + [
