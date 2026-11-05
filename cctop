@@ -158,7 +158,9 @@ def transcript_meta(session_id, cache):
 # gone. Covers ^x, /exit, closed tabs and Warp restarts alike. Claude doesn't record when a session
 # ended, so the view also tracks which Warp sessions are live (LIVE) and logs the ones that vanish
 # (ENDED), grouped by the tick they vanished in; a group of several is a Warp quit or restart.
-CLOSED_HOURS = 24
+CLOSED_DAYS = float(os.environ.get("CCTOP_CLOSED_DAYS") or 7)  # how far back recently closed goes
+CLOSED_SECONDS = CLOSED_DAYS * 86400
+CLOSED_GROUPS_MAX = 3  # reopen-all groups shown; older groups' sessions list individually
 CLOSED_MAX = 8
 CLOSED_MIN_PROMPTS = 2
 DISMISSED = os.path.join(CACHE_DIR, "dismissed.json")
@@ -167,8 +169,12 @@ ENDED = os.path.join(CACHE_DIR, "ended.json")
 TICK_GAP = 60  # longer between snapshots means the view wasn't running; times are then approximate
 
 
+def closed_window():
+    return "%g day%s" % (CLOSED_DAYS, "" if CLOSED_DAYS == 1 else "s")
+
+
 def closed_sessions(live_ids, cache):
-    cutoff = time.time() - CLOSED_HOURS * 3600
+    cutoff = time.time() - CLOSED_SECONDS
     dismissed = set(load_json(DISMISSED, []))
     ended = load_json(ENDED, {})
     candidates = {}
@@ -238,7 +244,7 @@ def closed_section(live_ids, cache):
     closed = closed_sessions(live_ids, cache)
     by_sid = {r["sessionId"]: r for r in closed}
     blocks = []
-    for group in restore_groups(live_ids):
+    for group in restore_groups(live_ids)[:CLOSED_GROUPS_MAX]:
         block = [group]
         for i, m in enumerate(group["members"]):
             row = by_sid.pop(m["sessionId"], None) or dict(
@@ -293,7 +299,7 @@ def track_ended(rows):
             ended.setdefault(sid, dict(prev["sessions"][sid], at=batch, batch=batch))
     for sid in live:
         ended.pop(sid, None)  # reopened
-    ended = {k: v for k, v in ended.items() if now - v["at"] < CLOSED_HOURS * 3600}
+    ended = {k: v for k, v in ended.items() if now - v["at"] < CLOSED_SECONDS}
     order = warp_tab_order([r["pid"] for r in live.values()])
     save_json(ENDED, ended)
     save_json(LIVE, {"at": now, "sessions": {sid: {"title": title(r), "cwd": r.get("cwd"),
@@ -424,7 +430,7 @@ def collect():
         rows.append(s)
     rows += closed_section({r.get("sessionId") for r in rows}, cache)
     keep = {r.get("transcript") for r in rows if r.get("transcript")}
-    save_json(META_CACHE, {k: v for k, v in cache.items() if k in keep or v["mtime"] > time.time() - CLOSED_HOURS * 3600})
+    save_json(META_CACHE, {k: v for k, v in cache.items() if k in keep or v["mtime"] > time.time() - CLOSED_SECONDS})
     return rows
 
 
@@ -690,8 +696,8 @@ def cmd_list(_):
 def cmd_preview(args):
     s = find(args[0])
     if s.get("kind") == "divider":
-        print(DIM + "Sessions that ended in the last %d hours, plus any group that closed together\n"
-              "(a Warp quit or restart). enter reopens; ^x removes from this list." % CLOSED_HOURS + RESET)
+        print(DIM + "Sessions that ended in the last %s, plus groups that closed together (a Warp\n"
+              "quit or restart). enter reopens; ^x removes from this list." % closed_window() + RESET)
         return
     if s.get("kind") == "batch":
         print(BOLD + title(s) + RESET + "\n")
@@ -1023,13 +1029,13 @@ HELP = """{b}Keys{r}
   ○ idle        no activity for 2h to 2 days
   · stale       no activity for over 2 days
   ✓ done        its PR is merged or closed
-  ↺ closed      ended in the last 24h; reopen-all groups sessions that closed together
+  ↺ closed      ended in the last {window}; reopen-all groups sessions that closed together
 
 {d}Move the cursor to return to the session preview.{r}"""
 
 
 def cmd_help(_):
-    print(HELP.format(b=BOLD, d=DIM, r=RESET))
+    print(HELP.format(b=BOLD, d=DIM, r=RESET, window=closed_window()))
 
 
 def new_session_dir(s):

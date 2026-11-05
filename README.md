@@ -14,9 +14,9 @@ A live dashboard of your running [Claude Code](https://claude.com/claude-code) s
   including uncommitted changes.
 - **Jump to a session's tab** with `enter`, using Warp's per-session focus link. No tab cycling.
 - **Close** a session and its tab with `^x`. Claude exits cleanly and the conversation stays resumable.
-- **Recently closed:** sessions that ended in the last 24 hours, however they ended, each reopenable in a new
-  tab. Sessions that closed together (a Warp restart, say) are grouped so you can reopen them all at once, in
-  their original tab order.
+- **Recently closed:** sessions that ended in the last 7 days (set `CCTOP_CLOSED_DAYS` to change it), however
+  they ended, each reopenable in a new tab. Sessions that closed together (a Warp restart, say) are grouped so
+  you can reopen them all at once, in their original tab order.
 - **New session** in a new tab with `^n`, diff with `^d`, open in VS Code with `^e`, open the PR with `^o`.
   `^t` switches between all sessions and only those in Warp tabs. `?` shows every key.
 
